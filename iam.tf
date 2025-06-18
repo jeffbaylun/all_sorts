@@ -51,39 +51,40 @@ locals {
       if contains(keys(v.app_config), "TITANFLOW_DF_REGISTRATION_SVC_INGEST_SQS_QUEUE_URLS")
     ]
   ))
-  ## S3: group by bucket name, wildcard each bucket
-  s3_bucket_names = distinct([
+
+  # S3: bucket + (optional) first folder, depth = 2
+  s3_prefix_depth2 = try(
+    distinct([
       for arn in local.target_table_s3_arns :
-      element(split("/", element(split(":::", arn), 1)), 0)
+      regexall("^arn:aws:s3:::[^/]+(?:/[^/]+)?", arn)[0]
+    ]),
+    []
+  )
+  grouped_s3_prefixes = sort([
+    for p in local.s3_prefix_depth2 :
+    "${p}/*"
   ])
-  grouped_s3_prefixes = [
-      for b in local.s3_bucket_names :
-      "arn:aws:s3:::${b}/*"
-  ]
-
-  ## SQS: group by queue name (one ARN per queue, no length check)
-  sqs_queue_names = distinct([
+  # SQS: full queue name, depth = 1
+  sqs_prefix = try(
+    distinct([
       for arn in local.ingest_queues_arns :
-      element(split(":", arn), 5)
-  ])
-  grouped_sqs_prefixes = [
-      for q in local.sqs_queue_names :
-      "arn:aws:sqs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:${q}"
-  ]
-
-  ## Glue: group at the database level, wildcard each table
-  glue_resources = [
+      regexall("^arn:aws:sqs:[^:]+:[^:]+:[^/]+", arn)[0]
+    ]),
+    []
+  )
+  grouped_sqs_prefixes = sort(local.sqs_prefix)
+  # Glue: database/table grouping, depth = 3
+  glue_prefix_depth3 = try(
+    distinct([
       for arn in local.target_table_glue_arns :
-      element(split(":", arn), 5)              # yields "table/db_name/table_name"
-  ]
-  glue_db_roots = distinct([
-      for res in local.glue_resources :
-      join("/", slice(split("/", res), 0, 2))  # yields "table/db_name"
+      regexall("^arn:aws:glue:[^:]+:[^:]+:table/[^/]+/[^/]+", arn)[0]
+    ]),
+    []
+  )
+  grouped_glue_prefixes = sort([
+    for p in local.glue_prefix_depth3 :
+    "${p}/*"
   ])
-  grouped_glue_prefixes = [
-      for root in local.glue_db_roots :
-      "${join(":", slice(split(":", local.target_table_glue_arns[0]), 0, 5))}/${root}/*"
-  ]
 }
 
 #
@@ -93,7 +94,7 @@ module "aws_iam_role" {
   count = local.aws_iam_role_creation
   source = "git::https://github.com/comcast-zorrillo/titanflow-infra//modules/aws/iam-role?ref=modules/aws/iam-role/v0.2.0"
 
-  iam_role_suffix = "${local.name}-iceberg-df-reg-svc-eks-pod-role"
+  iam_role_suffix    = "${local.name}-iceberg-df-reg-svc-eks-pod-role"
   assume_role_policy = jsonencode({
     version = "2012-10-17"
     statement = [
@@ -132,7 +133,7 @@ data "aws_iam_policy_document" "queue_consumer_access" {
       "sqs:ChangeMessageVisibility"
     ]
 
-    resources = length(local.ingest_queues_arns) > 32 ? local.ingest_queues_arns : ["*"]
+    resources = local.grouped_sqs_prefixes
   }
 }
 
@@ -143,7 +144,7 @@ resource "aws_iam_role_policy" "queue_consumer_access" {
 }
 
 data "aws_iam_policy_document" "s3_write_access" {
-  version = "2012-10-17"
+  version   = "2012-10-17"
 
   statement {
     sid     = "PutMetadataAndDatafiles"
@@ -167,7 +168,7 @@ resource "aws_iam_role_policy" "s3_write_access" {
 }
 
 data "aws_iam_policy_document" "glue_write_access" {
-  version = "2012-10-17"
+  version   = "2012-10-17"
 
   statement {
     sid     = "GetCatalog"
@@ -179,19 +180,7 @@ data "aws_iam_policy_document" "glue_write_access" {
       "glue:UpdateTable"
     ]
 
-    resources = concat(
-      distinct (
-        [
-          for glue_table in data.aws_glue_catalog_table.this : "arn:aws:glue:${data.aws_region.this.name}:${glue_table.catalog_id}:catalog"
-        ]
-      ),
-      distinct (
-        [
-          for glue_table in data.aws_glue_catalog_table.this : "arn:aws:glue:${data.aws_region.this.name}:${glue_table.catalog_id}:database/${glue_table.database_name}"
-        ]
-      ),
-      length(local.target_table_glue_arns) < 32 ? local.target_table_glue_arns : ["*"]       
-    )
+    resources = local.grouped_glue_prefixes
   }
 }
 
@@ -202,7 +191,7 @@ resource "aws_iam_role_policy" "glue_write_access" {
 }
 
 data "aws_iam_policy_document" "sideline_access" {
-  version = "2012-10-17"
+  version   = "2012-10-17"
   statement {
     effect  = "Allow"
     actions = [
@@ -225,7 +214,7 @@ resource "aws_iam_role_policy" "sideline_access" {
 
 resource "kubernetes_service_account" "this" {
   metadata {
-      name = local.service_name
+      name      = local.service_name
       namespace = var.kubernetes_namespace
       annotations = {
         "eks.amazonaws.com/role-arn" = local.aws_iam_role_arn

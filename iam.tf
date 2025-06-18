@@ -2,209 +2,233 @@
 # Data sources
 #
 data "aws_eks_cluster" "this" {
-    name = var.eks_cluster_name
+  name = var.eks_cluster_name
 }
 data "aws_iam_openid_connect_provider" "this" {
-    url = data.aws_eks_cluster.this.identity[0].oidc[0].issuer
+  url = data.aws_eks_cluster.this.identity[0].oidc[0].issuer
 }
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
 
 #
 # Local variables
 #
 locals {
-    aws_iam_role_creation = (var.aws_iam_role_arn != null || local.enabled_feeds == {}) ? 0 : 1
-    aws_iam_role_arn      = coalesce(
-        var.aws_iam_role_arn,
-        length(module.aws_iam_role) > 0 ? try(module.aws_iam_role[0].iam_role_arn, null) : null
-    )
-    aws_iam_role_name     = coalesce(
-        try(split("/", var.aws_iam_role_arn)[length(split("/", var.aws_iam_role_arn)) - 1], null),
-        try(module.aws_iam_role[0].iam_role_name, null)
-    )
+  aws_iam_role_creation = (var.aws_iam_role_arn != null || local.enabled_feeds == {}) ? 0 : 1
+  aws_iam_role_arn      = coalesce(
+    var.aws_iam_role_arn,
+    length(module.aws_iam_role) > 0 ? try(module.aws_iam_role[0].iam_role_arn, null) : null
+  )
+  aws_iam_role_name     = coalesce(
+    try(split("/", var.aws_iam_role_arn)[length(split("/", var.aws_iam_role_arn)) - 1], null),
+    try(module.aws_iam_role[0].iam_role_name, null)
+  )
 
-    target_table_s3_arns  = distinct(
-        [
-            for glue_table in data.aws_glue_catalog_table.this : 
-            "arn:aws:s3:::${replace(glue_table.storage_descriptor[0].location, "s3://", "")}/*"
-        ]
-    )
-    target_table_glue_arns = distinct(
-        [
-            for glue_table in data.aws_glue_catalog_table.this : 
-            "${join(":", slice(split(":", glue_table.arn), 0, 4))}:${glue_table.catalog_id}:${join(":", slice(split(":", glue_table.arn), 5, length(split(":", glue_table.arn))))}"
-        ]
-    )
-    ingest_queues_arns    = distinct(concat(
-        [
-            for staging in module.ingest_enabled_feed_by_s3_location_aws_sqs : staging.ingest_queues_arn
-        ],
-        [
-            for v in local.enabled_feeds :
-                format(
-                    "arn:aws:sqs:%s:%s:%s",
-                    split(".", replace(v.app_config["TITANFLOW_DF_REGISTRATION_SVC_INGEST_SQS_QUEUE_URLS"], "https://", "")) [1],   # region
-                    split("/", v.app_config["TITANFLOW_DF_REGISTRATION_SVC_INGEST_SQS_QUEUE_URLS"]) [3],                            # account ID
-                    split("/", v.app_config["TITANFLOW_DF_REGISTRATION_SVC_INGEST_SQS_QUEUE_URLS"]) [4]                             # queue name    
-                )
-            if contains(keys(v.app_config), "TITANFLOW_DF_REGISTRATION_SVC_INGEST_SQS_QUEUE_URLS")
-        ]
-    ))
+  target_table_s3_arns  = distinct(
+      [
+        for glue_table in data.aws_glue_catalog_table.this : 
+        "arn:aws:s3:::${replace(glue_table.storage_descriptor[0].location, "s3://", "")}/*"
+      ]
+  )
+  target_table_glue_arns = distinct(
+      [
+        for glue_table in data.aws_glue_catalog_table.this : 
+        "${join(":", slice(split(":", glue_table.arn), 0, 4))}:${glue_table.catalog_id}:${join(":", slice(split(":", glue_table.arn), 5, length(split(":", glue_table.arn))))}"
+      ]
+  )
+  ingest_queues_arns    = distinct(concat(
+    [
+      for staging in module.ingest_enabled_feed_by_s3_location_aws_sqs : staging.ingest_queues_arn
+    ],
+    [
+      for v in local.enabled_feeds :
+        format(
+            "arn:aws:sqs:%s:%s:%s",
+            split(".", replace(v.app_config["TITANFLOW_DF_REGISTRATION_SVC_INGEST_SQS_QUEUE_URLS"], "https://", "")) [1],   # region
+            split("/", v.app_config["TITANFLOW_DF_REGISTRATION_SVC_INGEST_SQS_QUEUE_URLS"]) [3],                            # account ID
+            split("/", v.app_config["TITANFLOW_DF_REGISTRATION_SVC_INGEST_SQS_QUEUE_URLS"]) [4]                             # queue name    
+        )
+      if contains(keys(v.app_config), "TITANFLOW_DF_REGISTRATION_SVC_INGEST_SQS_QUEUE_URLS")
+    ]
+  ))
+  ## S3: group by bucket name, wildcard each bucket
+  s3_bucket_names = distinct([
+      for arn in local.target_table_s3_arns :
+      element(split("/", element(split(":::", arn), 1)), 0)
+  ])
+  grouped_s3_prefixes = [
+      for b in local.s3_bucket_names :
+      "arn:aws:s3:::${b}/*"
+  ]
+
+  ## SQS: group by queue name (one ARN per queue, no length check)
+  sqs_queue_names = distinct([
+      for arn in local.ingest_queues_arns :
+      element(split(":", arn), 5)
+  ])
+  grouped_sqs_prefixes = [
+      for q in local.sqs_queue_names :
+      "arn:aws:sqs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:${q}"
+  ]
+
+  ## Glue: group at the database level, wildcard each table
+  glue_resources = [
+      for arn in local.target_table_glue_arns :
+      element(split(":", arn), 5)              # yields "table/db_name/table_name"
+  ]
+  glue_db_roots = distinct([
+      for res in local.glue_resources :
+      join("/", slice(split("/", res), 0, 2))  # yields "table/db_name"
+  ])
+  grouped_glue_prefixes = [
+      for root in local.glue_db_roots :
+      "${join(":", slice(split(":", local.target_table_glue_arns[0]), 0, 5))}/${root}/*"
+  ]
 }
 
 #
 # Resources
 #
 module "aws_iam_role" {
-    count = local.aws_iam_role_creation
-    source = "git::https://github.com/comcast-zorrillo/titanflow-infra//modules/aws/iam-role?ref=modules/aws/iam-role/v0.2.0"
+  count = local.aws_iam_role_creation
+  source = "git::https://github.com/comcast-zorrillo/titanflow-infra//modules/aws/iam-role?ref=modules/aws/iam-role/v0.2.0"
 
-    iam_role_suffix = "${local.name}-iceberg-df-reg-svc-eks-pod-role"
-    assume_role_policy = jsonencode({
-        version = "2012-10-17"
-        statement = [
-            {
-                effect        = "Allow"
-                action        = "sts:AssumeRoleWithWebIdentity"
-                principal     = {
-                    federated = data.aws_iam_openid_connect_provider.this.arn
-                }
-            },
-            {
-                effect      = "Allow"
-                action      = ["sts:AssumeRole"]
-                principal   = {
-                    service = "ec2.amazonaws.com"
-                }
-            },
-            {
-                sid       = "AllowApplicationOwnersToAssumeRole"
-                effect    = "Allow"
-                action    = ["sts:AssumeRole"]
-                principal = {
-                      aws = "arn:aws:iam::${data.aws_caller_identity.this.account_id}:role/ApplicationOwner"
-                }
-            }
-        ]
-    })
+  iam_role_suffix = "${local.name}-iceberg-df-reg-svc-eks-pod-role"
+  assume_role_policy = jsonencode({
+    version = "2012-10-17"
+    statement = [
+      {
+        effect        = "Allow"
+        action        = "sts:AssumeRoleWithWebIdentity"
+        principal     = {federated = data.aws_iam_openid_connect_provider.this.arn}
+      },
+
+      {
+        effect        = "Allow"
+        action        = ["sts:AssumeRole"]
+        principal     = {service = "ec2.amazonaws.com"}
+      },
+
+      {
+        sid           = "AllowApplicationOwnersToAssumeRole"
+        effect        = "Allow"
+        action        = ["sts:AssumeRole"]
+        principal     = {aws = "arn:aws:iam::${data.aws_caller_identity.this.account_id}:role/ApplicationOwner"}
+      }
+    ]
+  })
 }
 
 data "aws_iam_policy_document" "queue_consumer_access" {
-    version = "2012-10-17"
+  version = "2012-10-17"
 
-    statement {
-        effect    = "Allow"
-        actions   = [
-            "sqs:ReceiveMessage",
-            "sqs:DeleteMessage",
-            "sqs:GetQueueAttributes",
-            "sqs:GetQueueUrl",
-            "sqs:ChangeMessageVisibility"
-        ]
+  statement {
+    effect    = "Allow"
+    actions   = [
+      "sqs:ReceiveMessage",
+      "sqs:DeleteMessage",
+      "sqs:GetQueueAttributes",
+      "sqs:GetQueueUrl",
+      "sqs:ChangeMessageVisibility"
+    ]
 
-        resources = length(local.ingest_queues_arns) > 32 ? local.ingest_queues_arns : ["*"]
-    }
+    resources = length(local.ingest_queues_arns) > 32 ? local.ingest_queues_arns : ["*"]
+  }
 }
 
 resource "aws_iam_role_policy" "queue_consumer_access" {
-    name   = "queue-consumer-access-${local.module_id}"
-    role   = local.aws_iam_role_name
-    policy = data.aws_iam_policy_document.queue_consumer_access.json
+  name   = "queue-consumer-access-${local.module_id}"
+  role   = local.aws_iam_role_name
+  policy = data.aws_iam_policy_document.queue_consumer_access.json
 }
 
 data "aws_iam_policy_document" "s3_write_access" {
-    version = "2012-10-17"
+  version = "2012-10-17"
 
-    statement {
-        sid = "PutMetadataAndDatafiles"
-        effect = "Allow"
-        actions = [
-            "s3:ListBucket"
-            "s3:GetObject",
-            "s3:GetObjectTagging",
-            "s3:PutObject",
-            "s3:PutObjectTagging"            
-        ]
+  statement {
+    sid     = "PutMetadataAndDatafiles"
+    effect  = "Allow"
+    actions = [
+      "s3:ListBucket",
+      "s3:GetObject",
+      "s3:GetObjectTagging",
+      "s3:PutObject",
+      "s3:PutObjectTagging",
+    ]
 
-        resources = concat(distinct(
-            [
-                for glue_table in data.aws_glue_catalog_table.this : "arn:aws:s3:::${split("/", glue_table.storage_descriptor[0].location)[2]}"
-            ]),
-            length(local.target_table_s3_arns) < 32 ? local.target_table_s3_arns : distinct([
-                for glue_table in data.aws_glue_catalog_table.this : "arn:aws:s3:::${split("/", glue_table.storage_descriptor[0].location)[2]}/*"
-            ])
-        )
-    }
+    resources = local.grouped_s3_prefixes
+  }
 }
 
 resource "aws_iam_role_policy" "s3_write_access" {
-    name   = "s3-write-access-${local.module_id}"
-    role   = local.aws_iam_role_name
-    policy = data.aws_iam_policy_document.s3_write_access.json
+  name   = "s3-write-access-${local.module_id}"
+  role   = local.aws_iam_role_name
+  policy = data.aws_iam_policy_document.s3_write_access.json
 }
 
 data "aws_iam_policy_document" "glue_write_access" {
-    version = "2012-10-17"
+  version = "2012-10-17"
 
-    statement {
-        sid     = "GetCatalog"
-        effect  = "Allow"
-        actions = [
-            "glue:GetDatabase",
-            "glue:GetDatabases",
-            "glue:GetTable",
-            "glue:UpdateTable",
+  statement {
+    sid     = "GetCatalog"
+    effect  = "Allow"
+    actions = [
+      "glue:GetDatabase",
+      "glue:GetDatabases",
+      "glue:GetTable",
+      "glue:UpdateTable"
+    ]
+
+    resources = concat(
+      distinct (
+        [
+          for glue_table in data.aws_glue_catalog_table.this : "arn:aws:glue:${data.aws_region.this.name}:${glue_table.catalog_id}:catalog"
         ]
-
-        resources = concat(
-            distinct (
-                [
-                    for glue_table in data.aws_glue_catalog_table.this : "arn:aws:glue:${data.aws_region.this.name}:${glue_table.catalog_id}:catalog"
-                ]
-            ),
-            distinct (
-                [
-                    for glue_table in data.aws_glue_catalog_table.this : "arn:aws:glue:${data.aws_region.this.name}:${glue_table.catalog_id}:database/${glue_table.database_name}"
-                ]
-            ),
-            length(local.target_table_glue_arns) < 32 ? local.target_table_glue_arns : ["*"]       
-        )
-    }
+      ),
+      distinct (
+        [
+          for glue_table in data.aws_glue_catalog_table.this : "arn:aws:glue:${data.aws_region.this.name}:${glue_table.catalog_id}:database/${glue_table.database_name}"
+        ]
+      ),
+      length(local.target_table_glue_arns) < 32 ? local.target_table_glue_arns : ["*"]       
+    )
+  }
 }
 
 resource "aws_iam_role_policy" "glue_write_access" {
-    name   = "glue-write-access-${local.module_id}"
-    role   = local.aws_iam_role_name
-    policy = data.aws_iam_policy_document.glue_write_access.json
+  name   = "glue-write-access-${local.module_id}"
+  role   = local.aws_iam_role_name
+  policy = data.aws_iam_policy_document.glue_write_access.json
 }
 
 data "aws_iam_policy_document" "sideline_access" {
-    version = "2012-10-17"
-    statement {
-        effect  = "Allow"
-        actions = [
-            "sqs:SendMessage",
-            "sqs:DeleteMessage",
-            "sqs:GetQueueAttributes",
-            "sqs:GetQueueUrl",
-            "sqs:ListQueues"
-        ]
+  version = "2012-10-17"
+  statement {
+    effect  = "Allow"
+    actions = [
+      "sqs:SendMessage",
+      "sqs:DeleteMessage",
+      "sqs:GetQueueAttributes",
+      "sqs:GetQueueUrl",
+      "sqs:ListQueues"
+    ]
 
-        resources = length(local.ingest_queues_arns) > 32 ? local.ingest_queues_arns : ["*"]
-    }
+    resources = length(local.ingest_queues_arns) > 32 ? local.ingest_queues_arns : ["*"]
+  }
 }
 
 resource "aws_iam_role_policy" "sideline_access" {
-    name   = "sideline-access-${local.module_id}"
-    role   = local.aws_iam_role_name
-    policy = data.aws_iam_policy_document.sideline_access.json
+  name   = "sideline-access-${local.module_id}"
+  role   = local.aws_iam_role_name
+  policy = data.aws_iam_policy_document.sideline_access.json
 }
 
 resource "kubernetes_service_account" "this" {
-    metadata {
-        name = local.service_name
-        namespace = var.kubernetes_namespace
-        annotations = {
-            "eks.amazonaws.com/role-arn" = local.aws_iam_role_arn
-        }
-    }
+  metadata {
+      name = local.service_name
+      namespace = var.kubernetes_namespace
+      annotations = {
+        "eks.amazonaws.com/role-arn" = local.aws_iam_role_arn
+      }
+  }
 }
